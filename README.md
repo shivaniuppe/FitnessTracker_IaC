@@ -75,7 +75,7 @@ Exposes RESTful endpoints for the following functionalities:
 ### Deployment Steps:
 1. **Clone the repository:**
    ```
-   git clone <repository-url>
+   git clone https://github.com/shivaniuppe/FitnessTracker_IaC.git
    ```
 
 2. **Deploy the CloudFormation template:**
