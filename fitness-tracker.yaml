@@ -1,0 +1,449 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Users
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: email
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  FitnessDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: FitnessData
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  CreateUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: createUser
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: arn:aws:iam::677348720327:role/LabRole
+      Environment:
+        Variables:
+          SNSTopicArn: !Ref SNSTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              try:
+                  user = json.loads(event['body'])
+                  
+                  # Subscribe the user's email to the SNS topic
+                  print('TopicArn:', os.environ['SNSTopicArn'])
+
+                  subscribe_params = {
+                      'Protocol': 'email',
+                      'TopicArn': os.environ['SNSTopicArn'],
+                      'Endpoint': user['email']
+                  }
+                  sns.subscribe(**subscribe_params)
+
+                  table = dynamodb.Table('Users')
+                  table.put_item(Item=user)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({ 'status': 'success' })
+                  }
+              except Exception as e:
+                  print(e)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                  }
+
+  GetUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getUser
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: arn:aws:iam::677348720327:role/LabRole
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def lambda_handler(event, context):
+              try:
+                  print("Event: ", event)
+                  user_id = event['pathParameters'].get('userId', '')
+                  user_email = event['pathParameters'].get('email', '')
+
+                  if not user_id or not user_email:
+                      raise ValueError('Missing userId or email in the path parameters')
+
+                  table = dynamodb.Table('Users')
+                  params = {
+                      'Key': {
+                        'userId': user_id,
+                        'email': user_email
+                      }
+                  }
+
+                  result = table.get_item(**params)
+                  print("Result: ", result)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(result['Item'], cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  print('Error:', e)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                  }
+        
+
+  SubmitFitnessDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: submitFitnessData
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: arn:aws:iam::677348720327:role/LabRole
+      Environment:
+        Variables:
+          SNSTopicArn: !Ref SNSTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+          sns = boto3.client('sns')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def lambda_handler(event, context):
+              try:
+                  print("Event: ", event)
+                  fitness_data = json.loads(event['body'])
+                  print("Fitness Data: ", fitness_data)
+                  user_id = fitness_data['userId']
+                  user_email = fitness_data['email']
+
+                  user_table = dynamodb.Table('Users')
+                  user_params = {
+                      'Key': {
+                          'userId': user_id,
+                          'email': user_email
+                      }
+                  }
+                  user_result = user_table.get_item(**user_params)
+                  print("User Result: ", user_result)
+                  user = user_result.get('Item')
+
+
+                  if not user:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({ 'error': 'User not found' })
+                      }
+
+                  previous_total_steps = user.get('totalSteps', 0)
+                  new_total_steps = previous_total_steps + fitness_data['steps']
+
+                  fitness_data['totalSteps'] = new_total_steps
+                  fitness_table = dynamodb.Table('FitnessData')
+                  fitness_table.put_item(Item=fitness_data)
+
+                  if new_total_steps >= user['fitnessGoal']:
+                      eventbridge.put_events(
+                          Entries=[{
+                              'Source': 'FitnessTracker',
+                              'DetailType': 'FitnessGoalAchieved',
+                              'Detail': json.dumps({
+                                  'userId': user_id,
+                                  'totalSteps': new_total_steps,
+                                  'fitnessGoal': user['fitnessGoal']  
+                              }, cls=DecimalEncoder)
+                          }]
+                      )
+                    
+                  update_params = {
+                      'Key': {
+                          'userId': user_id,
+                          'email': user_email
+                      },
+                      'UpdateExpression': 'set totalSteps = :t',
+                      'ExpressionAttributeValues': { ':t': new_total_steps }
+                  }
+                  user_table.update_item(**update_params)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({ 'status': 'success', 'totalSteps': new_total_steps }, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  print("Error: ", e)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                  }
+
+  GetFitnessDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getFitnessData
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: arn:aws:iam::677348720327:role/LabRole
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('FitnessData')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def lambda_handler(event, context):
+              try:
+                  user_id = event['pathParameters']['userId']
+                  print("User ID: ", user_id)
+                  params = {
+                      'KeyConditionExpression': 'userId = :userId',
+                      'ExpressionAttributeValues': { ':userId': user_id }
+                  }
+                  result = table.query(**params)
+                  print("Query Result: ", result)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({ 'data': result['Items'] }, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  print("Error: ", e)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                  }
+      
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: FitnessTrackerApi
+
+  ApiGatewayResourceUsers:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: users
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceUserId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiGatewayResourceUsers
+      PathPart: "{userId}"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceEmail:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiGatewayResourceUserId
+      PathPart: "{email}"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceFitness:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: fitness
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceFitnessUserId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !Ref ApiGatewayResourceFitness
+      PathPart: "{userId}"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayMethodPostUser:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResourceUsers
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateUserFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::677348720327:role/LabRole
+
+  ApiGatewayMethodGetUser:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResourceEmail
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUserFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::677348720327:role/LabRole
+
+  ApiGatewayMethodPostFitness:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResourceFitness
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitFitnessDataFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::677348720327:role/LabRole
+
+  ApiGatewayMethodGetFitness:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResourceFitnessUserId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetFitnessDataFunction.Arn}/invocations"
+          - { Region: !Ref "AWS::Region" }
+        Credentials: arn:aws:iam::677348720327:role/LabRole
+
+  FitnessGoalStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: EXPRESS
+      DefinitionString: !Sub |
+        {
+          "Comment": "State machine for handling fitness goal achievements",
+          "StartAt": "NotifyUser",
+          "States": {
+            "NotifyUser": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${SNSTopic}",
+                "Message": "Congratulations! You've achieved your fitness goal!"
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: arn:aws:iam::677348720327:role/LabRole
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt EventBridgeLogGroup.Arn
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "FitnessTracker"
+        detail-type:
+          - "FitnessGoalAchieved"
+        detail:
+          userId:
+            - exists: true
+          totalSteps:
+            - exists: true
+          fitnessGoal:
+            - exists: true
+      Targets:
+        - Arn: !GetAtt FitnessGoalStateMachine.Arn
+          Id: "TargetFunction"
+          RoleArn: arn:aws:iam::677348720327:role/LabRole
+        - Arn: !GetAtt EventBridgeLogGroup.Arn
+          Id: "CloudWatchLogGroup"
+          
+  EventBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/FitnessTrackerEvents
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FitnessGoalNotifications
+      
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+    DependsOn: 
+      - ApiGatewayMethodPostUser
+      - ApiGatewayMethodGetUser
+      - ApiGatewayMethodPostFitness
+      - ApiGatewayMethodGetFitness
+Outputs:
+  ApiUrl:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
