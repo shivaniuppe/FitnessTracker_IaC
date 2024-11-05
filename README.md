@@ -1,7 +1,3 @@
-Here's a README file based on your Infrastructure-as-Code (IaC) project:
-
----
-
 # Fitness Tracker Cloud Application
 
 ## Project Overview
