@@ -1,4 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: Deployment environment (prod, dev, test).
+
 Resources:
   UsersTable:
     Type: AWS::DynamoDB::Table
@@ -14,10 +21,19 @@ Resources:
           KeyType: HASH
         - AttributeName: email
           KeyType: RANGE
-      ProvisionedThroughput:
-        ReadCapacityUnits: 5
-        WriteCapacityUnits: 5
-
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: Production
+        - Key: Application
+          Value: FitnessTracker
+     
   FitnessDataTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -32,9 +48,35 @@ Resources:
           KeyType: HASH
         - AttributeName: timestamp
           KeyType: RANGE
-      ProvisionedThroughput:
-        ReadCapacityUnits: 5
-        WriteCapacityUnits: 5
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: Production
+        - Key: Application
+          Value: FitnessTracker
+
+  DynamoDBBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: FitnessTrackerBackupPlan
+        BackupPlanRule:
+          - RuleName: DailyBackup
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: "cron(0 12 * * ? *)"
+            Lifecycle:
+              DeleteAfterDays: 30
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: FitnessTrackerBackupVault
 
   CreateUserFunction:
     Type: AWS::Lambda::Function
@@ -42,22 +84,42 @@ Resources:
       FunctionName: createUser
       Handler: index.lambda_handler
       Runtime: python3.12
-      Role: arn:aws:iam::677348720327:role/LabRole
+      Role: arn:aws:iam::610402022930:role/LabRole
       Environment:
         Variables:
           SNSTopicArn: !Ref SNSTopic
+          USER_POOL_ID: !Ref CognitoUserPool
       Code:
         ZipFile: |
           import json
           import boto3
           import os
+          from botocore.exceptions import ClientError
 
           dynamodb = boto3.resource('dynamodb')
           sns = boto3.client('sns')
+          cognito = boto3.client('cognito-idp')
 
           def lambda_handler(event, context):
               try:
                   user = json.loads(event['body'])
+
+                  try:
+                      response = cognito.admin_create_user(
+                          UserPoolId=os.environ['USER_POOL_ID'],  # Pass User Pool ID as an environment variable  
+                          Username=user['email'],  # Use email as the username
+                          UserAttributes=[
+                              {'Name': 'email', 'Value': user['email']},
+                          ]
+                      )
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'UsernameExistsException':
+                          return {
+                              'statusCode': 409,  # Conflict HTTP status code
+                              'body': json.dumps({ 'error': 'User already exists' })
+                          }
+                      else:
+                          raise
                   
                   # Subscribe the user's email to the SNS topic
                   print('TopicArn:', os.environ['SNSTopicArn'])
@@ -82,6 +144,16 @@ Resources:
                       'statusCode': 500,
                       'body': json.dumps({ 'error': 'Internal Server Error' })
                   }
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      TracingConfig:
+        Mode: Active 
+      Timeout: 10
+
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: LambdaDLQ
 
   GetUserFunction:
     Type: AWS::Lambda::Function
@@ -89,50 +161,125 @@ Resources:
       FunctionName: getUser
       Handler: index.lambda_handler
       Runtime: python3.12
-      Role: arn:aws:iam::677348720327:role/LabRole
+      Role: arn:aws:iam::610402022930:role/LabRole
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          REGION: us-east-1 
       Code:
         ZipFile: |
           import json
+          import base64
+          from urllib.request import urlopen
           import boto3
           from decimal import Decimal
 
+          # Initialize DynamoDB resource
           dynamodb = boto3.resource('dynamodb')
+
+          # Helper class to handle Decimal encoding in JSON
           class DecimalEncoder(json.JSONEncoder):
               def default(self, obj):
                   if isinstance(obj, Decimal):
                       return float(obj)
                   return super(DecimalEncoder, self).default(obj)
 
+          # Function to decode base64 strings with padding
+          def base64_decode(data):
+              padding = '=' * (-len(data) % 4)
+              return base64.urlsafe_b64decode(data + padding)
+
+          # Function to decode the JWT token
+          def decode_token(token):
+              """Decode JWT token and return the payload."""
+              parts = token.split('.')
+              if len(parts) != 3:
+                  raise ValueError('Invalid token format')
+              payload = json.loads(base64_decode(parts[1]).decode('utf-8'))
+              return payload
+
+          # Main Lambda handler
           def lambda_handler(event, context):
               try:
                   print("Event: ", event)
-                  user_id = event['pathParameters'].get('userId', '')
+
+                  # Extract Authorization token from headers
+                  auth_header = event['headers'].get('Authorization', '')
+                  if not auth_header or not auth_header.startswith('Bearer '):
+                      return {
+                          'statusCode': 401,
+                          'body': json.dumps({'error': 'Missing or invalid Authorization header'})
+                      }
+
+                  token = auth_header.split(' ')[1]
+
+                  # Decode the token
+                  decoded_token = decode_token(token)
+
+                  # Extract email from token
+                  token_email = decoded_token.get('email')
+                  if not token_email:
+                      return {
+                          'statusCode': 403,
+                          'body': json.dumps({'error': 'Unauthorized: Email not found in token'})
+                      }
+
+                  # Get the email and userId from path parameters
                   user_email = event['pathParameters'].get('email', '')
+                  user_id = event['pathParameters'].get('userId', '')
+                  if not user_email or not user_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing email or userId in path parameters'})
+                      }
 
-                  if not user_id or not user_email:
-                      raise ValueError('Missing userId or email in the path parameters')
+                  # Match email from token with the email parameter
+                  if token_email != user_email:
+                      return {
+                          'statusCode': 403,
+                          'body': json.dumps({'error': 'Unauthorized access: Email mismatch'})
+                      }
 
+                  # Fetch user details from DynamoDB
                   table = dynamodb.Table('Users')
                   params = {
                       'Key': {
-                        'userId': user_id,
-                        'email': user_email
+                          'userId': user_id,
+                          'email': user_email
                       }
                   }
 
                   result = table.get_item(**params)
                   print("Result: ", result)
 
+                  # Handle case where user is not found
+                  if 'Item' not in result:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'User not found'})
+                      }
+
+                  # Return user details
                   return {
                       'statusCode': 200,
                       'body': json.dumps(result['Item'], cls=DecimalEncoder)
                   }
+
               except Exception as e:
                   print('Error:', e)
                   return {
                       'statusCode': 500,
-                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                      'body': json.dumps({'error': 'Internal Server Error'})
                   }
+
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      TracingConfig:
+        Mode: Active
+      Timeout: 10
+
+
+      
         
 
   SubmitFitnessDataFunction:
@@ -141,19 +288,35 @@ Resources:
       FunctionName: submitFitnessData
       Handler: index.lambda_handler
       Runtime: python3.12
-      Role: arn:aws:iam::677348720327:role/LabRole
+      Role: arn:aws:iam::610402022930:role/LabRole
       Environment:
         Variables:
           SNSTopicArn: !Ref SNSTopic
       Code:
         ZipFile: |
           import json
+          import base64
           import boto3
           from decimal import Decimal
+          from urllib.request import urlopen
 
           dynamodb = boto3.resource('dynamodb')
           eventbridge = boto3.client('events')
           sns = boto3.client('sns')
+
+          # Helper function to decode base64 strings with padding
+          def base64_decode(data):
+              padding = '=' * (-len(data) % 4)
+              return base64.urlsafe_b64decode(data + padding)
+
+          # Function to decode the JWT token
+          def decode_token(token):
+              """Decode JWT token and return the payload."""
+              parts = token.split('.')
+              if len(parts) != 3:
+                  raise ValueError('Invalid token format')
+              payload = json.loads(base64_decode(parts[1]).decode('utf-8'))
+              return payload
 
           class DecimalEncoder(json.JSONEncoder):
               def default(self, obj):
@@ -164,11 +327,42 @@ Resources:
           def lambda_handler(event, context):
               try:
                   print("Event: ", event)
+
+                  # Extract Authorization token from headers
+                  auth_header = event['headers'].get('Authorization', '')
+                  if not auth_header or not auth_header.startswith('Bearer '):
+                      return {
+                          'statusCode': 401,
+                          'body': json.dumps({'error': 'Missing or invalid Authorization header'})
+                      }
+
+                  token = auth_header.split(' ')[1]
+
+                  # Decode the token
+                  decoded_token = decode_token(token)
+
+                  # Extract email from token
+                  token_email = decoded_token.get('email')
+                  if not token_email:
+                      return {
+                          'statusCode': 403,
+                          'body': json.dumps({'error': 'Unauthorized: Email not found in token'})
+                      }
+
+                  # Extract userId and email from fitness data (body)
                   fitness_data = json.loads(event['body'])
                   print("Fitness Data: ", fitness_data)
                   user_id = fitness_data['userId']
                   user_email = fitness_data['email']
 
+                  # Validate that the email in the token matches the email in the body
+                  if token_email != user_email:
+                      return {
+                          'statusCode': 403,
+                          'body': json.dumps({'error': 'Unauthorized access: Email mismatch'})
+                      }
+
+                  # Fetch user data from DynamoDB
                   user_table = dynamodb.Table('Users')
                   user_params = {
                       'Key': {
@@ -179,7 +373,6 @@ Resources:
                   user_result = user_table.get_item(**user_params)
                   print("User Result: ", user_result)
                   user = user_result.get('Item')
-
 
                   if not user:
                       return {
@@ -194,6 +387,7 @@ Resources:
                   fitness_table = dynamodb.Table('FitnessData')
                   fitness_table.put_item(Item=fitness_data)
 
+                  # Check if fitness goal is achieved
                   if new_total_steps >= user['fitnessGoal']:
                       eventbridge.put_events(
                           Entries=[{
@@ -206,7 +400,8 @@ Resources:
                               }, cls=DecimalEncoder)
                           }]
                       )
-                    
+
+                  # Update user's total steps in the Users table
                   update_params = {
                       'Key': {
                           'userId': user_id,
@@ -221,6 +416,7 @@ Resources:
                       'statusCode': 200,
                       'body': json.dumps({ 'status': 'success', 'totalSteps': new_total_steps }, cls=DecimalEncoder)
                   }
+
               except Exception as e:
                   print("Error: ", e)
                   return {
@@ -228,21 +424,47 @@ Resources:
                       'body': json.dumps({ 'error': 'Internal Server Error' })
                   }
 
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      TracingConfig:
+        Mode: Active
+      Timeout: 10
+
+     
   GetFitnessDataFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: getFitnessData
       Handler: index.lambda_handler
       Runtime: python3.12
-      Role: arn:aws:iam::677348720327:role/LabRole
+      Role: arn:aws:iam::610402022930:role/LabRole
       Code:
         ZipFile: |
           import json
+          import base64
           import boto3
           from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
 
           dynamodb = boto3.resource('dynamodb')
-          table = dynamodb.Table('FitnessData')
+          users_table = dynamodb.Table('Users')
+          fitness_data_table = dynamodb.Table('FitnessData')
+
+
+          def base64_decode(data):
+              """Decode base64 string, adding padding if necessary."""
+              padding = '=' * (-len(data) % 4)
+              return base64.urlsafe_b64decode(data + padding)
+
+
+          def decode_token(token):
+              """Decode JWT token and return the payload."""
+              parts = token.split('.')
+              if len(parts) != 3:
+                  raise ValueError('Invalid token format')
+              payload = json.loads(base64_decode(parts[1]).decode('utf-8'))
+              return payload
+
 
           class DecimalEncoder(json.JSONEncoder):
               def default(self, obj):
@@ -250,33 +472,162 @@ Resources:
                       return float(obj)
                   return super(DecimalEncoder, self).default(obj)
 
+
           def lambda_handler(event, context):
               try:
-                  user_id = event['pathParameters']['userId']
-                  print("User ID: ", user_id)
-                  params = {
-                      'KeyConditionExpression': 'userId = :userId',
-                      'ExpressionAttributeValues': { ':userId': user_id }
-                  }
-                  result = table.query(**params)
-                  print("Query Result: ", result)
+                  # Extract Authorization token from headers
+                  auth_header = event['headers'].get('Authorization', '')
+                  if not auth_header or not auth_header.startswith('Bearer '):
+                      return {
+                          'statusCode': 401,
+                          'body': json.dumps({'error': 'Missing or invalid Authorization header'})
+                      }
+
+                  token = auth_header.split(' ')[1]
+                  decoded_token = decode_token(token)
+
+                  # Extract email from the token
+                  token_email = decoded_token.get('email')
+                  if not token_email:
+                      return {
+                          'statusCode': 403,
+                          'body': json.dumps({'error': 'Unauthorized: Email not found in token'})
+                      }
+
+                  # Extract userId from path parameters
+                  user_id = event['pathParameters'].get('userId')
+                  if not user_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing userId in path parameters'})
+                      }
+
+                  # Fetch user details from Users table
+                  user_data = users_table.get_item(Key={'userId': user_id, 'email': token_email})
+                  if 'Item' not in user_data:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'User not found or email mismatch'})
+                      }
+
+                  # Fetch fitness data from FitnessData table
+                  fitness_data = fitness_data_table.query(KeyConditionExpression=Key('userId').eq(user_id))
+                  if not fitness_data.get('Items'):
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'No fitness data found for user'})
+                      }
 
                   return {
                       'statusCode': 200,
-                      'body': json.dumps({ 'data': result['Items'] }, cls=DecimalEncoder)
+                      'body': json.dumps({'fitnessData': fitness_data['Items']}, cls=DecimalEncoder)
                   }
+
               except Exception as e:
                   print("Error: ", e)
                   return {
                       'statusCode': 500,
-                      'body': json.dumps({ 'error': 'Internal Server Error' })
+                      'body': json.dumps({'error': 'Internal Server Error'})
                   }
-      
+
+
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      TracingConfig:
+        Mode: Active
+      Timeout: 10
+
+
+  CreateUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CreateUserFunction}"
+      RetentionInDays: 7
+
+  GetUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${GetUserFunction}"
+      RetentionInDays: 7
+
+  SubmitFitnessDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SubmitFitnessDataFunction}"
+      RetentionInDays: 7
+
+  GetFitnessDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${GetFitnessDataFunction}"
+      RetentionInDays: 7
+     
 
   ApiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
       Name: FitnessTrackerApi
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+    
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+    DependsOn:
+      - ApiGatewayMethodPostUser
+      - ApiGatewayMethodGetUser
+      - ApiGatewayMethodPostFitness
+      - ApiGatewayMethodGetFitness
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+      TracingEnabled: true
+      MethodSettings:
+        - HttpMethod: "*"
+          ResourcePath: "/*"
+          CacheDataEncrypted: true
+          CacheTtlInSeconds: 3600
+          CachingEnabled: true
+          LoggingLevel: INFO
+          ThrottlingBurstLimit: 100
+          DataTraceEnabled: true
+          ThrottlingRateLimit: 50
+          MetricsEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-execution-logs"
+      RetentionInDays: 14
+
+  ApiGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: FitnessTrackerUsagePlan
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: !Ref ApiGatewayStage
+      Throttle:
+        RateLimit: 50
+        BurstLimit: 100
+      Quota:
+        Limit: 1000
+        Period: MONTH
 
   ApiGatewayResourceUsers:
     Type: AWS::ApiGateway::Resource
@@ -313,6 +664,19 @@ Resources:
       PathPart: "{userId}"
       RestApiId: !Ref ApiGateway
 
+  ApiGatewayResourcePolicy:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MyApi  
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: 
+              Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/users
+
   ApiGatewayMethodPostUser:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -326,7 +690,7 @@ Resources:
         Uri: !Sub 
           - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateUserFunction.Arn}/invocations"
           - { Region: !Ref "AWS::Region" }
-        Credentials: arn:aws:iam::677348720327:role/LabRole
+        Credentials: arn:aws:iam::610402022930:role/LabRole
 
   ApiGatewayMethodGetUser:
     Type: AWS::ApiGateway::Method
@@ -334,14 +698,15 @@ Resources:
       RestApiId: !Ref ApiGateway
       ResourceId: !Ref ApiGatewayResourceEmail
       HttpMethod: GET
-      AuthorizationType: NONE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 
           - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUserFunction.Arn}/invocations"
           - { Region: !Ref "AWS::Region" }
-        Credentials: arn:aws:iam::677348720327:role/LabRole
+        Credentials: arn:aws:iam::610402022930:role/LabRole
 
   ApiGatewayMethodPostFitness:
     Type: AWS::ApiGateway::Method
@@ -349,14 +714,15 @@ Resources:
       RestApiId: !Ref ApiGateway
       ResourceId: !Ref ApiGatewayResourceFitness
       HttpMethod: POST
-      AuthorizationType: NONE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 
           - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitFitnessDataFunction.Arn}/invocations"
           - { Region: !Ref "AWS::Region" }
-        Credentials: arn:aws:iam::677348720327:role/LabRole
+        Credentials: arn:aws:iam::610402022930:role/LabRole
 
   ApiGatewayMethodGetFitness:
     Type: AWS::ApiGateway::Method
@@ -364,14 +730,15 @@ Resources:
       RestApiId: !Ref ApiGateway
       ResourceId: !Ref ApiGatewayResourceFitnessUserId
       HttpMethod: GET
-      AuthorizationType: NONE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 
           - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetFitnessDataFunction.Arn}/invocations"
           - { Region: !Ref "AWS::Region" }
-        Credentials: arn:aws:iam::677348720327:role/LabRole
+        Credentials: arn:aws:iam::610402022930:role/LabRole
 
   FitnessGoalStateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -389,11 +756,47 @@ Resources:
                 "TopicArn": "${SNSTopic}",
                 "Message": "Congratulations! You've achieved your fitness goal!"
               },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error-info",
+                  "Next": "LogFailure"
+                }
+              ],
+              "End": true
+            },
+            "LogFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+              "Parameters": {
+                "Namespace": "FitnessTracker",
+                "MetricData": [
+                  {
+                    "MetricName": "GoalNotificationFailures",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                      {
+                        "Name": "StateMachineName",
+                        "Value": "${AWS::StackName}-FitnessGoalStateMachine"
+                      }
+                    ]
+                  }
+                ]
+              },
               "End": true
             }
           }
         }
-      RoleArn: arn:aws:iam::677348720327:role/LabRole
+      RoleArn: arn:aws:iam::610402022930:role/LabRole
       LoggingConfiguration:
         Level: ALL
         IncludeExecutionData: true
@@ -418,32 +821,137 @@ Resources:
             - exists: true
       Targets:
         - Arn: !GetAtt FitnessGoalStateMachine.Arn
-          Id: "TargetFunction"
-          RoleArn: arn:aws:iam::677348720327:role/LabRole
-        - Arn: !GetAtt EventBridgeLogGroup.Arn
-          Id: "CloudWatchLogGroup"
+          Id: "TargetStateMachine"
+          RoleArn: arn:aws:iam::610402022930:role/LabRole
           
   EventBridgeLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: /aws/events/FitnessTrackerEvents
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: FitnessTrackerEventLogs
+
+  EventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FitnessTrackerDLQ
+      MessageRetentionPeriod: 1209600  # Retain messages for 14 days
+      Tags:
+        - Key: Environment
+          Value: Production
+
+  EventBridgeRuleTargetDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventBridgeDLQ
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDLQ.Arn
+
+  EventBridgeRuleWithDLQ:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "FitnessTracker"
+        detail-type:
+          - "FitnessGoalAchieved"
+      Targets:
+        - Arn: !GetAtt FitnessGoalStateMachine.Arn
+          Id: "StateMachineTarget"
+          RoleArn: arn:aws:iam::610402022930:role/LabRole
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
 
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: FitnessGoalNotifications
-      
-  ApiGatewayDeployment:
-    Type: AWS::ApiGateway::Deployment
+  
+  SNSSQSSubscriptionQueue:
+    Type: AWS::SQS::Queue
     Properties:
+      QueueName: SNSSQSSubscriptionQueue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SNSTopicDLQ.Arn
+        maxReceiveCount: 5  # Messages are moved to DLQ after 5 failed processing attempts
+
+  SNSTopicDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SNSTopicDLQ
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SNSSQSSubscriptionQueue.Arn
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: FitnessTrackerUserPool
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+          
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: FitnessTrackerClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - USER_PASSWORD_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: FitnessTrackerIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoUserPoolClient
+          ProviderName: !Sub "cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+      AllowUnauthenticatedIdentities: false
+  
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        authenticated: arn:aws:iam::610402022930:role/LabRole
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuth
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
       RestApiId: !Ref ApiGateway
-      StageName: prod
-    DependsOn: 
-      - ApiGatewayMethodPostUser
-      - ApiGatewayMethodGetUser
-      - ApiGatewayMethodPostFitness
-      - ApiGatewayMethodGetFitness
+      ProviderARNs:
+        - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}"
+
 Outputs:
   ApiUrl:
     Description: "API Gateway endpoint URL"
     Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+  SNSTopicArn:
+    Description: "SNS Topic ARN for Fitness Notifications"
+    Value: !Ref SNSTopic
